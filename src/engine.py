@@ -1,13 +1,13 @@
-"""ECS架构 - 带6个bug的引擎"""
+"""ECS架构核心"""
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
-import heapq
 
 
 @dataclass
 class Component:
     entity_id: int
     data: dict = field(default_factory=dict)
+    valid: bool = True
 
 
 class Entity:
@@ -22,7 +22,7 @@ class System:
         self.name = name
         self.update_fn = update_fn
         self.depends_on = depends_on or []
-        self.active_entities: list[int] = []  # bug1: 销毁后不更新缓存
+        self.active_entities: list[int] = []
 
 
 class EventBus:
@@ -33,8 +33,8 @@ class EventBus:
         self.handlers.setdefault(event, []).append(handler)
 
     def emit(self, event: str, data: Any = None):
-        # bug5: 直接迭代handlers，回调里销毁发送者会导致迭代器失效
-        for handler in self.handlers.get(event, []):
+        # 快照迭代：回调里增删handler或销毁发送者不影响本次派发
+        for handler in list(self.handlers.get(event, [])):
             handler(data)
 
 
@@ -51,15 +51,21 @@ class ComponentPool:
             self.pool.append(None)
         else:
             idx = self.free.pop()
-        # bug6: 复用后不清零旧数据
-        comp = Component(entity_id)
-        self.pool[idx] = comp
+        comp = self.pool[idx]
+        if comp is None:
+            comp = Component(entity_id)
+            self.pool[idx] = comp
+        else:
+            # 复用前清零上一个实体的所有字段
+            comp.entity_id = entity_id
+            comp.data.clear()
+            comp.valid = True
         return comp
 
     def release(self, comp: Component):
         for i, c in enumerate(self.pool):
             if c is comp:
-                self.pool[i] = None
+                comp.valid = False
                 self.free.append(i)
                 break
 
@@ -67,7 +73,7 @@ class ComponentPool:
 class QueryCache:
     def __init__(self):
         self.cache: dict[str, list[int]] = {}
-        self.dirty = True  # bug4: 增删实体后不标记失效
+        self.dirty = True
 
     def get(self, key: str, build_fn: Callable) -> list[int]:
         if self.dirty or key not in self.cache:
@@ -95,10 +101,21 @@ class ECS:
         return ent
 
     def destroy_entity(self, eid: int):
-        # bug1: 只从主列表删，不通知系统缓存
-        if eid in self.entities:
-            del self.entities[eid]
-        # bug2: 不通知其他实体的组件引用失效
+        ent = self.entities.pop(eid, None)
+        if ent is None:
+            return
+        ent.alive = False
+        # 释放组件并让外部持有的组件引用失效
+        for comp_type, comp in ent.components.items():
+            pool = self.pools.get(comp_type)
+            if pool is not None:
+                pool.release(comp)
+            comp.valid = False
+        ent.components.clear()
+        # 同步更新所有系统的活跃实体缓存
+        for sys in self.systems:
+            if eid in sys.active_entities:
+                sys.active_entities = [e for e in sys.active_entities if e != eid]
         self.query_cache.dirty = True
 
     def add_component(self, eid: int, comp_type: str, data: dict = None) -> Component:
@@ -107,23 +124,45 @@ class ECS:
         comp = self.pools[comp_type].acquire(eid)
         comp.data = data or {}
         self.entities[eid].components[comp_type] = comp
+        self.query_cache.dirty = True
         return comp
 
     def get_component(self, eid: int, comp_type: str) -> Optional[Component]:
         ent = self.entities.get(eid)
-        if ent:
-            return ent.components.get(comp_type)
-        return None  # bug2: 应该检测引用失效但直接返回None
+        if ent is None or not ent.alive:
+            return None
+        comp = ent.components.get(comp_type)
+        if comp is None or not comp.valid:
+            return None
+        return comp
 
     def register_system(self, system: System):
         self.systems.append(system)
-        # bug3: 按注册顺序执行，不做拓扑排序
+
+    def _sorted_systems(self) -> list[System]:
+        """按依赖声明拓扑排序，同级保持注册顺序；循环依赖时打断回边"""
+        by_name = {s.name: s for s in self.systems}
+        order: list[System] = []
+        state: dict[str, int] = {}  # 1=visiting, 2=done
+
+        def visit(name: str):
+            if state.get(name) or name not in by_name:
+                return
+            state[name] = 1
+            for dep in by_name[name].depends_on:
+                if state.get(dep) != 1:
+                    visit(dep)
+            state[name] = 2
+            order.append(by_name[name])
+
+        for s in self.systems:
+            visit(s.name)
+        return order
 
     def update(self, dt: float = 1.0):
-        # bug3: 固定注册顺序
-        for sys in self.systems:
+        for sys in self._sorted_systems():
             alive = [eid for eid in sys.active_entities if eid in self.entities]
-            sys.active_entities = alive  # bug1: 只在这里更新，销毁后下一帧才生效
+            sys.active_entities = alive
             sys.update_fn(self, alive, dt)
 
     def query(self, comp_types: list[str]) -> list[int]:
